@@ -1,0 +1,7 @@
+{
+  "my-app": {
+    "repo": "your-name/my-app",
+    "read_first": ["AGENTS.md", "docs/architecture.md"]
+  },
+  "old-app-name": {"alias_of": "my-app"}
+}

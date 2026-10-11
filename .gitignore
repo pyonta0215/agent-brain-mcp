@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.aws-sam/
+.scratch/
+src/projects.json
+samconfig.toml

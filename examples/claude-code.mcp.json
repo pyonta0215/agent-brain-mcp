@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "brain": {
+      "type": "http",
+      "url": "${BRAIN_RESOURCE}",
+      "headersHelper": "python3 /path/to/agent-brain-mcp/client/brain_auth_header.py"
+    }
+  }
+}

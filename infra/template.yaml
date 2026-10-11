@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Agent Brain - shared memory MCP for AI agents (HTTP API + Cognito JWT + Lambda + DynamoDB)
+
+Parameters:
+  AuthDomainPrefix:
+    Type: String
+    AllowedPattern: '^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$'
+    Description: Cognito hosted UI domain prefix (globally unique, e.g. my-agent-brain-1234)
+  ConnectorCallbackUrl:
+    Type: String
+    Default: https://claude.ai/api/mcp/auth_callback
+    AllowedPattern: '^https://.+'
+    Description: OAuth callback of the MCP client that people log in from (claude.ai custom connector)
+  WriterAgentName:
+    Type: String
+    Default: claude-code
+    AllowedPattern: '^[a-z][a-z0-9-]{1,31}$'
+    Description: Agent name recorded for the read/write machine client
+  ReaderAgentName:
+    Type: String
+    Default: reader
+    AllowedPattern: '^[a-z][a-z0-9-]{1,31}$'
+    Description: Agent name recorded for the read-only machine client
+
+Resources:
+  BrainTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+        - AttributeName: gsi2pk
+          AttributeType: S
+        - AttributeName: gsi2sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: gsi2
+          KeySchema:
+            - AttributeName: gsi2pk
+              KeyType: HASH
+            - AttributeName: gsi2sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ログインできるのは管理者が作ったユーザーだけ（自己登録なし）。
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref AuthDomainPrefix
+
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp'
+      Name: brain-mcp
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read entries and project state
+        - ScopeName: write
+          ScopeDescription: Record decisions, memories, actions and ideas
+
+  # 人がログインして使う MCP クライアント（claude.ai のカスタムコネクタ）。secret なし、Code + PKCE。
+  ConnectorClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: connector
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      CallbackURLs: [!Ref ConnectorCallbackUrl]
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      EnableTokenRevocation: true
+      PreventUserExistenceErrors: ENABLED
+
+  WriterAgentClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Ref WriterAgentName
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthScopes:
+        - !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp/read'
+        - !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp/write'
+      SupportedIdentityProviders: [COGNITO]
+      EnableTokenRevocation: true
+
+  ReaderAgentClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Ref ReaderAgentName
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthScopes:
+        - !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp/read'
+      SupportedIdentityProviders: [COGNITO]
+      EnableTokenRevocation: true
+
+  McpFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ReadAppendBrainTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !GetAtt BrainTable.Arn
+                  - !Sub '${BrainTable.Arn}/index/*'
+
+  McpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Agent Brain MCP (Streamable HTTP, stateless)
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.handler
+      Code: ../src
+      Role: !GetAtt McpFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          BRAIN_TABLE: !Ref BrainTable
+          BRAIN_RESOURCE: !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp'
+          BRAIN_AUTH_BASE: !Sub 'https://${AuthDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+          AGENT_CLIENTS: !Sub '{"${ConnectorClient}":"claude-connector","${WriterAgentClient}":"${WriterAgentName}","${ReaderAgentClient}":"${ReaderAgentName}"}'
+          INTERACTIVE_CLIENTS: !Ref ConnectorClient
+
+  McpFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${McpFunction}'
+      RetentionInDays: 30
+
+  McpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-mcp'
+      Description: Agent Brain MCP behind Cognito JWT
+      ProtocolType: HTTP
+
+  McpApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref McpApi
+      Name: brain-access-token
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        # aud がないトークンは client_id で照合される。claude.ai は resource を送るので、
+        # その場合の aud（MCP の URL）も受け付け、どのクライアントかは Lambda で確かめる。
+        Audience:
+          - !Ref ConnectorClient
+          - !Ref WriterAgentClient
+          - !Ref ReaderAgentClient
+          - !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp'
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+
+  McpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref McpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt McpFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 10000
+
+  McpRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref McpApi
+      RouteKey: 'ANY /mcp'
+      Target: !Join ['/', [integrations, !Ref McpApiIntegration]]
+      AuthorizationType: JWT
+      AuthorizerId: !Ref McpApiAuthorizer
+      AuthorizationScopes:
+        - !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp/read'
+        - openid
+
+  # OAuth の自動検出（保護リソースと認可サーバのメタデータ）。認証なしで公開してよい情報だけを返す。
+  DiscoveryRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref McpApi
+      RouteKey: 'GET /.well-known/{proxy+}'
+      Target: !Join ['/', [integrations, !Ref McpApiIntegration]]
+      AuthorizationType: NONE
+
+  McpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref McpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+
+  AllowApiInvokeMcpFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref McpFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${McpApi}/*/*'
+
+Outputs:
+  McpUrl:
+    Value: !Sub 'https://${McpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/mcp'
+  TokenUrl:
+    Value: !Sub 'https://${AuthDomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+  UserPoolId:
+    Value: !Ref UserPool
+  ConnectorClientId:
+    Value: !Ref ConnectorClient
+  WriterAgentClientId:
+    Value: !Ref WriterAgentClient
+  ReaderAgentClientId:
+    Value: !Ref ReaderAgentClient
+  TableName:
+    Value: !Ref BrainTable
